@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for API Gateway, Lambda, and EFS
+
+Resources:
+
+  # VPC
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '10.0.0.0/16'
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  # Subnet 1
+  Subnet1:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: '10.0.1.0/24'
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+
+
+
+  # EFS File System
+  FileSystem:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      Encrypted: true
+
+  MountTarget:
+    Type: 'AWS::EFS::MountTarget'
+    Properties: 
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref Subnet1
+      SecurityGroups: [ !Ref EFSSecurityGroup ]
+    DependsOn: EFSSecurityGroup
+
+
+  EFSSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'EFS security group'
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1  # -1 means all protocols
+          FromPort: 0     # 0 means all ports
+          ToPort: 65535   # 65535 means all ports
+          CidrIp: '0.0.0.0/0'  # Allow traffic from all IP addresses
+      SecurityGroupEgress:
+        - IpProtocol: -1  # -1 means all protocols
+          FromPort: 0     # 0 means all ports
+          ToPort: 65535   # 65535 means all ports
+          CidrIp: '0.0.0.0/0'  # Allow traffic to all IP addresses
+
+  AccessPoint:
+    Type: 'AWS::EFS::AccessPoint'
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: '1000'
+        Gid: '1000'
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: '1000'
+          OwnerUid: '1000'
+          Permissions: '750'
+        Path: "/lambda"
+    DependsOn:  MountTarget
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaEFSAccessPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'efs:ClientMount'
+                  - 'efs:ClientWrite'
+                Resource: "*"
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+        - PolicyName: LambdaVPCEndpointPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:ModifyNetworkInterfaceAttribute
+                Resource: "*"
+
+  # Lambda Function
+  ImageProcessorLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: 'index.handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from base64 import b64decode
+
+          def handler(event, context):
+              body = event['body']
+              
+              file_system_path = os.environ['EFS_PATH']
+              text_to_write = "Hello, this is a sample text."
+              # Define the file path and name
+              file_path = f"{file_system_path}/sample_file.txt"
+
+              # Open the file in write mode and write the string to it
+              with open(file_path, "w") as file:
+                file.write(text_to_write)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('File stored successfully!')
+              }
+      Runtime: 'python3.8'
+      Environment:
+        Variables:
+          EFS_PATH: '/mnt/efs'
+      FileSystemConfigs:
+        - Arn: !GetAtt AccessPoint.Arn
+          LocalMountPath: '/mnt/efs'
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+    DependsOn:
+      - AccessPoint
+      - LambdaExecutionRole
+
+
+
+  LambdaSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: 'Security group for Lambda function to access EFS'
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1  # -1 means all protocols
+          FromPort: 0     # 0 means all ports
+          ToPort: 65535   # 65535 means all ports
+          CidrIp: '0.0.0.0/0'  # Allow traffic from all IP addresses
+      SecurityGroupEgress:
+        - IpProtocol: -1  # -1 means all protocols
+          FromPort: 0     # 0 means all ports
+          ToPort: 65535   # 65535 means all ports
+          CidrIp: '0.0.0.0/0'  # Allow traffic to all IP addresses
+
+  # API Gateway RestApi
+  ApiGatewayRestApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: 'ImageProcessorApi'
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: dev
+    DependsOn: ApiGatewayMethod
+
+  # API Gateway Resource
+  ApiGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: 'images'
+      RestApiId: !Ref ApiGatewayRestApi
+
+  # API Gateway Method (POST)
+  ApiGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: 'NONE'
+      HttpMethod: 'POST'
+      ResourceId: !Ref ApiGatewayResource
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        IntegrationHttpMethod: 'POST'
+        Type: 'AWS_PROXY'
+        Uri: 
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageProcessorLambda.Arn}/invocations
+    DependsOn: ImageProcessorLambda
+
+  # Permission for API Gateway to invoke Lambda
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ImageProcessorLambda
+      Principal: 'apigateway.amazonaws.com'
+
+Outputs:
+  VPCId:
+    Description: 'VPC ID'
+    Value: !Ref MyVPC
+    Export:
+      Name: 'VPCId'
+
+  Subnet1Id:
+    Description: 'Subnet 1 ID'
+    Value: !Ref Subnet1
+    Export:
+      Name: 'Subnet1Id'
+
+  MyAccessPointArn:
+    Description: 'EFS Access Point ARN'
+    Value: !GetAtt AccessPoint.Arn
+    Export:
+      Name: 'MyAccessPointArn'
+
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL for POST method'
+    Value: 
+      Fn::Sub: https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/images
